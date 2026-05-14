@@ -1,6 +1,6 @@
-# BEV Static Obstacle Prediction — Yandex ML2 2026
+# BEV Static Obstacle Prediction
 
-1-е место на привате. Итоговый test IoU **0.6258** (baseline 0.40, top-2 0.56).
+Итоговый test IoU **0.6258**.
 
 Задача: предсказать бинарную occupancy-карту 188×126 (free / occupied / ignore=255)
 на BEV-сетке 0.8 м/пиксель, покрывающей 150 м вперёд × 100 м в стороны, по

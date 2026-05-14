@@ -1,240 +1,232 @@
-# Winning solution write-up
+# Разбор победившего решения
 
-Final private test IoU **0.6258** — 1st place. Public test IoU was higher
-(~0.65); private dropped ~0.02 because of a threshold call I'd make
-differently next time (see [Lessons learned](#lessons-learned)).
+Итоговый private test IoU **0.6258** — 1-е место. На паблике было выше (~0.65);
+private упал на ~0.02 из-за решения по threshold, которое в ретроспективе я бы
+принял иначе (см. [Что бы изменил](#что-бы-изменил)).
 
-This document tells the full story of how the solution evolved, what worked,
-what didn't, and what I'd do differently.
+Здесь полная история эволюции решения — что работало, что нет, и что бы я
+переделал.
 
-## 1. Data first
+## 1. Сначала данные
 
-The starting split was train/val = 4000/1000, but I quickly noticed that
-local validation IoU was a poor predictor of public leaderboard IoU — sometimes
-by 2–3 points. Looking at rover frequencies, the official val skewed heavily
-towards rovers that were rare on test, and one rover (`nack`) had a bunch of
-almost-empty GT maps that inflated easy-to-predict cases.
+Изначальное разбиение train/val = 4000/1000 было слишком несбалансированным:
+локальный val IoU плохо предсказывал паблик — иногда на 2–3 пункта. По
+частотам роверов было видно, что официальный val перекошен в сторону редких
+для теста роверов, а у одного ровера (`nack`) много почти-пустых GT-карт,
+которые искусственно завышали лёгкие случаи.
 
-So I merged train and val into a single pool of 5000 samples and resampled my
-own validation:
+Я слил train и val в один пул из 5000 сэмплов и пересобрал свою валидацию:
 
-- **Stratify by `(rover, ride_date)` group** so no group appears in both train
-  and val. This removes the trivial leak where val is just frames from the
-  same ride a few seconds before train frames.
-- **Per-rover weights matched to test distribution.** I read off the per-rover
-  count from test info.csv and pulled val samples in proportion. This brought
-  the rover-frequency TV distance between val and test from ~0.35 down to
-  ~0.18.
+- **Стратификация по группам `(rover, ride_date)`** — ни одна группа не
+  попадает одновременно в train и val. Это убирает тривиальную утечку, когда
+  val — это просто кадры с той же поездки за пару секунд до тренировочных.
+- **Веса роверов под распределение теста.** Снял per-rover счётчик из
+  test info.csv и тянул val-сэмплы пропорционально. TV-дистанция по частотам
+  роверов между val и test упала с ~0.35 до ~0.18.
 
-After two or three submissions I verified: **the new local val correlated with
-public to within ~0.005 IoU**. This was the single most important investment
-of the whole competition — it meant every subsequent experiment could be
-trusted locally before spending a submission slot.
+После двух-трёх посылок убедился: **локальный val коррелирует с пабликом в
+пределах ~0.005 IoU**. Это самая важная инвестиция за всё соревнование — после
+этого каждый эксперимент можно проверить локально, не тратя слот посылки.
 
-### Dataset cleanup
+### Чистка датасета
 
-While I had the data merged anyway:
+Раз уж объединил данные:
 
-- **Empty GT maps**: dropped frames where the GT had 0 occupied pixels (~26
-  samples). They added noise to BCE without teaching anything.
-- **Near-stationary duplicates**: when the rover stops at a traffic light you
-  get bursts of 10–30 frames that are visually identical. I grouped
-  consecutive frames within each `(rover, ride_date)` where the frontal image
-  hash had MAE < 0.02, and kept only the frame whose GT had the **most
-  obstacle pixels** (richer supervision signal). Trimmed a few hundred
-  redundant samples without losing any unique scene.
+- **Пустые GT-карты**: выкинул кадры с нулём занятых пикселей (~26 штук). Они
+  добавляли шум в BCE и ничему не учили.
+- **Почти-стоящие дубликаты**: когда ровер стоит на светофоре, идут пачки по
+  10–30 визуально идентичных кадров. Я группировал последовательные кадры
+  внутри `(rover, ride_date)`, у которых MAE по хешу фронтального изображения
+  < 0.02, и оставлял из группы только тот кадр, где в GT **больше всего
+  занятых пикселей** (богаче сигнал для обучения). Подрезал пару сотен
+  избыточных сэмплов без потери уникальных сцен.
 
-### Rover embeddings
+### Эмбеддинги роверов
 
-The fleet has many rovers, and each rover carries cameras at different mount
-positions, heights and focal lengths. Even with calibration as input, a
-single shared model has trouble modelling the systematic ground-projection
-bias per rover. I added a 32-dim rover embedding broadcast onto the BEV
-feature map before the decoder, which let the model learn a per-rover prior.
-Worth roughly +0.01 IoU on its own; more once combined with later
-calibration-aware FiLM conditioning.
+У флота много роверов, и у каждого камеры стоят на разной высоте, под разными
+углами, с разными фокусами. Даже когда калибровка подаётся в модель,
+единственный shared backbone плохо моделирует систематический per-rover bias
+проекции на землю. Добавил 32-мерный rover embedding, размазанный по BEV-фиче
+перед декодером — модель учится per-rover prior. Сам по себе даёт +0.01 IoU;
+больше — в связке с FiLM-кондишеном на rig-геометрию из v5.
 
-## 2. Splitting the pipeline: encoder vs post-image path
+## 2. Разделение пайплайна: encoder vs post-image path
 
-I separated the problem into two architectural questions:
+Я разделил задачу на два архитектурных вопроса:
 
-1. **Image encoder** — extract per-pixel features that contain everything the
-   downstream needs about what's in the image (semantic class, depth cues,
-   surface orientation).
-2. **Post-image path** — project those features from the 4 camera frames into
-   the shared BEV grid and decode into an occupancy logit.
+1. **Image encoder** — извлекает per-pixel фичи, в которых есть всё, что нужно
+   downstream'у про содержимое снимка (семантический класс, признаки глубины,
+   ориентация поверхности).
+2. **Post-image path** — проецирует эти фичи из четырёх камер на общую
+   BEV-сетку и декодирует в occupancy-логит.
 
-My intuition was that the **encoder was the bottleneck**, not the projection.
-The post-image path is constrained by geometry; you can't make it lift better
-than the input features allow. So I started by fixing a simple post-image
-path — parameter-free voxel sampling (Simple-BEV style) + a small UNet — and
-tried different encoders. Only later did I start playing with the post-image
-path.
+Интуиция говорила, что **узкое место — энкодер, а не проекция**. Post-image
+path упирается в геометрию; он не может «вылифтить» лучше, чем позволяют
+входные фичи. Поэтому я зафиксировал простой post-image path —
+parameter-free voxel sampling (стиль Simple-BEV) + маленький UNet — и
+перебирал энкодеры. Эксперименты с post-image начались уже после.
 
-## 3. Encoder experiments
+## 3. Эксперименты с энкодером
 
-### Plain ResNet (didn't fly)
+### Обычный ResNet (не зашёл)
 
-ResNet-18, -34, -50, -101 — all variants. ImageNet classification features
-care about the global label of an image and are translation-invariant by
-design. For BEV occupancy you need the *opposite*: features that are
-spatially precise and depth-aware. The plateau was around 0.51–0.53 IoU
-regardless of depth. Pretrained Simple-BEV's `Encoder_res101` (nuScenes-tuned)
-gave only a marginal lift — the bottleneck was the representation, not the
-weights.
+ResNet-18, -34, -50, -101 — все варианты. ImageNet-классификационные фичи
+заточены под глобальный лейбл и trans-инвариантны по построению. Для BEV
+occupancy нужно **обратное**: пространственно-точные, осознающие глубину фичи.
+Плато упиралось в 0.51–0.53 IoU независимо от глубины сетки. Предобученный
+`Encoder_res101` из Simple-BEV (на nuScenes) дал лишь маржинальный буст —
+дело в самой репрезентации, не в весах.
 
-### DINOv2 (the unlock)
+### DINOv2 (анлок)
 
-DINOv2 is a vision transformer self-supervised on a huge web corpus. What
-caught my eye in the DINOv2 paper: a *frozen* DINOv2 backbone plus a tiny
-linear head predicts monocular depth maps competitively. That's exactly the
-information BEV projection needs — for each image pixel, an estimate of where
-it lives in 3D.
+DINOv2 — vision transformer, обученный self-supervised на огромном веб-корпусе.
+Что зацепило в статье DINOv2: с **замороженным** DINOv2 и крошечной линейной
+головой можно предсказывать монокулярные depth-карты на конкурентном уровне.
+Это ровно та информация, которая нужна для BEV-проекции — для каждого пикселя
+оценка, где он в 3D.
 
-I plugged DINOv2 ViT-B/14 in as the image encoder (last two blocks
-fine-tunable, the rest frozen) and trained ~20 epochs on the same post-image
-path. Local val IoU jumped to **0.59+**, and the very first public submission
-hit **0.60+**. This was the moment the problem opened up.
+Воткнул DINOv2 ViT-B/14 в качестве image encoder (последние 2 блока
+fine-tunable, остальное заморожено), обучал ~20 эпох с тем же post-image path.
+Локальный val IoU прыгнул до **0.59+**, а самая первая публичная посылка выдала
+**0.60+**. В этот момент задача и открылась.
 
-### Other backbones (saved for ensemble)
+### Другие backbones (отложены в ансамбль)
 
-I also trained:
+Также обучил:
 
-- **RTMDet-L** (COCO-pretrained, CSPNeXt backbone) — ~0.56 IoU. Slightly
-  worse than DINOv2 alone but with very different failure modes.
-- **ConvNeXtV2-Base** with FCMAE pretraining (ImageNet-22k → ImageNet-1k) —
-  also ~0.57–0.58 IoU. WandB-tracked, resumable Colab training. Strongest
-  CNN backbone of the bunch.
-- **Swin Transformer + GeoMIM** pretraining — comparable but heavier to fine-
-  tune at the batch sizes I had.
+- **RTMDet-L** (COCO-pretrained, CSPNeXt backbone) — ~0.56 IoU. Чуть хуже
+  DINOv2, но с совсем другим характером ошибок.
+- **ConvNeXtV2-Base** с FCMAE-претрейном (ImageNet-22k → ImageNet-1k) —
+  тоже ~0.57–0.58 IoU. WandB-логирование, resumable Colab-тренировка.
+  Сильнейший CNN-backbone в этой пачке.
+- **Swin Transformer + GeoMIM** — сопоставимо, но тяжелее файнтюнить на тех
+  батчах, что у меня были.
 
-None of these caught DINOv2 solo, but they added diversity for the final
-ensemble — they made different mistakes.
+В соло никто DINOv2 не догнал, но для финального ансамбля они дали diversity —
+они ошибались по-разному.
 
-## 4. Post-image path experiments
+## 4. Эксперименты с post-image path
 
-Once DINOv2 was the encoder of choice I tried improving the projection:
+После выбора DINOv2 как энкодера попробовал улучшать саму проекцию:
 
-- **Parameter-free voxel sampling vs Lift-Splat-Shoot.** Switching to LSS
-  (learned per-pixel depth distribution that splats features into the BEV
-  grid) helped a bit on average; my final v6 family is LSS-based.
-- **BEV attention** (v61): self-attention layers in the BEV decoder so far-
-  away cells could exchange information with near cells. Marginal effect
-  solo.
-- **2× BEV resolution** (v62): double the projection resolution, then
-  bilinearly downsample. Idea was to give the decoder more spatial precision
-  near obstacle boundaries. Solo: marginal.
-- **Log-spaced depth bins** (v63): the default uniform depth bins in LSS
-  waste capacity on far distances. Log spacing concentrates bins in the near
-  range (0–30 m) where most obstacles sit. Solo: marginal.
+- **Parameter-free voxel sampling vs Lift-Splat-Shoot.** Переход на LSS
+  (обученное per-pixel распределение глубины, фичи расплёскиваются на BEV по
+  depth × ray) дал небольшой буст в среднем; финальная семья v6 — на LSS.
+- **BEV attention** (v61): self-attention в BEV-декодере, чтобы дальние клетки
+  обменивались информацией с ближними. Соло — маржинально.
+- **2× разрешение BEV** (v62): удваиваю разрешение проекции и потом bilinearly
+  даунсэмплю. Идея — дать декодеру больше пространственной точности на
+  границах препятствий. Соло — маржинально.
+- **Логарифмические бины глубины** (v63): дефолтные равномерные бины в LSS
+  тратят ёмкость на дальние диапазоны. Логарифмические концентрируют бины в
+  ближней зоне (0–30 м), где сидит большинство препятствий. Соло — маржинально.
 
-**None of these moved the needle solo.** My read at the time, which I still
-think is right: I'd hit the label noise ceiling. The GT itself is noisy —
-near-stationary frames sometimes have IoU < 1.0 between consecutive frames
-that should be identical. There's only so much signal to extract before
-you're fitting label noise.
+**Ни один из этих подходов соло не улучшил скор.** Мой тогдашний (и нынешний)
+вывод: я упёрся в потолок шумности самой разметки. GT сам по себе шумный — на
+почти-стоящих кадрах между соседними кадрами IoU иногда < 1.0, хотя должен
+быть единицей. Извлечь больше сигнала, чем там есть, нельзя — дальше начинаешь
+фитить шум.
 
-But the variations had **uncorrelated errors**, which is exactly what makes
-an ensemble useful. I kept them all for the final blend.
+Зато у вариаций были **некоррелированные ошибки**, а это ровно то, что нужно
+ансамблю. Все они отправились в финальный блeнд.
 
-## 5. Calibration-aware conditioning
+## 5. Calibration-aware кондишен
 
-In parallel I tried v5 — a model that doesn't just see rover_id but takes the
-**rig geometry directly** as input:
+Параллельно собрал v5 — модель, которая видит не только rover_id, но и
+**rig-геометрию напрямую**:
 
-- A 10-dim per-camera rig vector: normalised fx/fy/cx/cy + the camera's
-  position and forward axis in ego frame.
-- A 12-dim global rig summary: mean/std focals, left/right baseline,
-  front mid-far deltas.
-- FiLM modulators on both the image feature (per camera) and the BEV feature
-  (per sample).
-- A specialist embedding for the top-12 test rovers, gated by a sigmoid so
-  rare rovers stay near the shared trunk.
+- 10-мерный per-camera rig-вектор: нормированные fx/fy/cx/cy + позиция камеры
+  и её forward-ось в ego-фрейме.
+- 12-мерное per-sample глобальное rig-резюме: mean/std фокусов, L-R базис,
+  дельты front mid/far.
+- FiLM-модуляторы на фиче изображения (per camera) и на BEV-фиче (per sample).
+- Specialist embedding для топ-12 тестовых роверов, гейтированный сигмоидом —
+  редкие роверы остаются ближе к общему стволу.
 
-The intuition: rovers differ by *mount geometry* more than by neighbourhood.
-A rover_id embedding can only memorise this through correlation; explicit
-rig features tell the model "this camera is mounted 30 cm lower and points
-3° down", which is the geometric fact that actually matters.
+Идея: роверы различаются скорее **геометрией крепления**, чем местностью.
+Rover_id-эмбеддинг это запоминает только через корреляции; явные rig-фичи
+говорят модели «эта камера висит на 30 см ниже и смотрит на 3° вниз», а это
+геометрический факт, который реально важен.
 
-This helped most on rovers that dominate the test set but are rare in train.
+Помогло в основном на роверах, доминирующих в тесте, но редких в трейне.
 
-## 6. Final ensemble
+## 6. Финальный ансамбль
 
-The goal in the final week was **robustness**, not squeezing the last point.
-The blend:
+Цель в финальную неделю — **робастность**, а не выжимание последних долей.
+Блeнд:
 
-- Several DINOv2-LSS variants (v6, v61 BEV attention, v62 2× resolution,
-  v63 log depth) — same backbone, different post-image paths.
-- RTMDet-CSPNeXt + LSS — different backbone family.
-- ConvNeXtV2 + LSS — strongest single model.
-- (Some early v3-augs runs in earlier submissions.)
+- Несколько DINOv2-LSS вариантов (v6, v61 BEV-attention, v62 2× resolution,
+  v63 log depth) — один backbone, разные post-image паттерны.
+- RTMDet-CSPNeXt + LSS — другая семья backbone'ов.
+- ConvNeXtV2 + LSS — сильнейшая single-модель.
+- (В ранних посылках ещё были v3-augs прогоны.)
 
-Predictions are sigmoid-averaged. Ensemble weights are searched on the
-test-matched local val. The weight search notebooks are in
+Предсказания усредняются по sigmoid. Веса ансамбля подбираются на
+test-matched локальном val. Ноутбуки поиска — в
 [notebooks/ensemble/](notebooks/ensemble/).
 
-I also explored a small legal data-overlap exploit
-([scripts/exploit_leak.py](scripts/exploit_leak.py)): a handful of test
-frames have a near-identical (frontal MAE < 0.1) twin in train within the
-same `(rover, ride_date)` group. Copying the matching train GT into those
-test predictions is allowed under the rules. Worth ~0.005–0.01 IoU.
+Ещё аккуратно поэксплуатировал легальное пересечение данных
+([scripts/exploit_leak.py](scripts/exploit_leak.py)): у некоторых тестовых
+кадров есть почти-идентичный близнец в трейне (MAE по фронтальной картинке
+< 0.1) внутри той же группы `(rover, ride_date)`. Скопировать GT из
+соответствующего train-кадра в test-предсказание правилами не запрещено.
+Стоит ~0.005–0.01 IoU.
 
-## 7. The threshold call (lessons learned)
+## 7. История с threshold (что бы изменил)
 
-When you average sigmoid probabilities and then threshold, the optimal
-threshold sits somewhere between "what each individual model would pick" and
-"what the average ensemble sees". With 6+ models averaged, the probability
-distribution becomes much smoother — pixels that *any* model thinks are
-suspicious push the average up.
+Когда усредняешь sigmoid-вероятности и потом thresholdишь, оптимальный
+threshold сидит между «что бы выбрала каждая отдельная модель» и «что видит
+усреднённый ансамбль». С 6+ моделями распределение вероятностей становится
+сильно более гладким — пиксели, которые **любая** модель считает
+подозрительными, поднимают среднее.
 
-My local test-matched val said optimal threshold ≈ **0.54**. Public
-leaderboard sweep said **0.73**. That's a big gap. I trusted public.
+Мой локальный test-matched val сказал, что оптимум ≈ **0.54**. Свип по
+паблику сказал **0.73**. Разница большая. Я доверился паблику.
 
-**This was probably my one real mistake.** Private dropped ~0.02 from public,
-which is large for a stable ensemble. I think public had a slightly different
-balance of easy/hard frames than private + local val, and the high threshold
-overfitted to the *public* test set's prior. My local val was, in retrospect,
-a better approximation of *full* test (public + private). The right move
-would have been to take the geometric mean of the two thresholds (~0.63) or
-just trust local at 0.54.
+**Это, наверное, моя единственная реальная ошибка.** Private упал на ~0.02
+относительно паблика — для стабильного ансамбля это много. Думаю, у паблика
+был чуть другой баланс лёгких/тяжёлых кадров vs private + локальный val, и
+высокий threshold переобучился под *паблик*. В ретроспективе мой локальный val
+лучше приближал **полный** тест (паблик + приват). Правильный ход — взять
+геометрическое среднее двух threshold (~0.63) или просто доверять локалу 0.54.
 
-Lessons for next time:
+### Что бы изменил
 
-- **Validation set design is half the problem.** Build it carefully and then
-  *trust* it, even when public says something else.
-- **Treat the public leaderboard as a single noisy submission**, not as ground
-  truth. With ~10–20 successful submissions, you have 10–20 measurements of
-  noisy public score and 1 measurement of carefully-designed local val.
-- When local and public disagree, **average the implied parameter**, don't
-  pick the larger sample size.
+- **Дизайн валидации — это половина задачи.** Построить её аккуратно — а потом
+  *доверять*, даже когда паблик говорит другое.
+- **Паблик-лидерборд — это одна шумная посылка**, а не ground truth. С ~10–20
+  успешными посылками у тебя 10–20 шумных замеров паблика и 1 замер тщательно
+  сделанного локала.
+- Когда локал и паблик расходятся — **усредни параметр**, не выбирай по
+  размеру выборки.
 
-## 8. What's in this repo
+## 8. Что где в репо
 
-See [README.md](README.md) for the full stage-by-stage layout. The
-ensemble-relevant pieces of code live in:
+Полная разбивка по этапам в [README.md](README.md). Релевантные для ансамбля
+куски кода:
 
-- [src/data.py](src/data.py), [src/splits.py](src/splits.py) — dataset and
-  rover-matched val split.
+- [src/data.py](src/data.py), [src/splits.py](src/splits.py) — датасет и
+  rover-matched val-сплит.
 - [src/models/v4.py](src/models/v4.py), [src/models/v5.py](src/models/v5.py)
-  — rover embedding and FiLM models.
-- [scripts/smart_dedup.py](scripts/smart_dedup.py) — near-stationary dedup.
-- [scripts/exploit_leak.py](scripts/exploit_leak.py) — train/test overlap
-  exploit.
+  — модели с rover embedding и FiLM.
+- [scripts/smart_dedup.py](scripts/smart_dedup.py) — дедуп почти-стоящих
+  кадров.
+- [scripts/exploit_leak.py](scripts/exploit_leak.py) — эксплоит совпадений
+  train/test.
 - [notebooks/stage_v6_dinov2_lss/](notebooks/stage_v6_dinov2_lss/) — DINOv2 +
-  LSS variants (the workhorses of the final blend).
+  LSS варианты (рабочие лошадки финального блeнда).
 - [notebooks/stage_v8_convnextv2/](notebooks/stage_v8_convnextv2/) —
   ConvNeXtV2 + FCMAE.
-- [notebooks/ensemble/](notebooks/ensemble/) — blend weight search and
-  submission packing.
+- [notebooks/ensemble/](notebooks/ensemble/) — поиск весов блeнда и упаковка
+  сабмишена.
 
-## 9. References
+## 9. Ссылки
 
 - *DINOv2: Learning Robust Visual Features without Supervision*, Oquab et
-  al., arXiv:2304.07193 — the unlocking paper, especially the linear-probe
-  depth results.
+  al., arXiv:2304.07193 — анлок-статья, особенно линейный probe по depth.
 - *Simple-BEV: What Really Matters for Multi-Sensor BEV Perception?*, Harley
-  et al., arXiv:2206.07959 — the post-image path baseline.
-- *Lift, Splat, Shoot*, Philion & Fidler, ECCV 2020 — the learned depth
-  view-transform used in v6.
-- *ConvNeXt V2*, Woo et al., CVPR 2023 — the FCMAE pretraining used in v8.
-- *The Lovász-Softmax loss*, Berman et al., CVPR 2018 — direct IoU surrogate.
+  et al., arXiv:2206.07959 — baseline для post-image path.
+- *Lift, Splat, Shoot*, Philion & Fidler, ECCV 2020 — обученный
+  depth-кондишенный view transform, который пошёл в v6.
+- *ConvNeXt V2*, Woo et al., CVPR 2023 — FCMAE-претрейн в v8.
+- *The Lovász-Softmax loss*, Berman et al., CVPR 2018 — прямой суррогат IoU.

@@ -1,0 +1,29 @@
+# Datasets, weights, archives — too large for git
+autonomy_yandex_dataset_*/
+*.zip
+*.pt
+*.pth
+*.safetensors
+*.npy
+*.npz
+
+# Runs / logs / caches
+runs/
+wandb/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.mypy_cache/
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+
+# Local-only
+inference_eval/
+ensemble_pray/
+predicted_static_grids/
+submissions/
+submission*/
+kaggle_safe_exports*/

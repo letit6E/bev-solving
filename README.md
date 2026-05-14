@@ -29,7 +29,8 @@ src/                        cleaned shared modules
     simplebev_adapter.py    wrap pretrained Simple-BEV for zero-shot scoring
 scripts/                    one-off CLI tools
 notebooks/                  per-stage experiments (cell outputs kept, code lives in src/)
-plans/                      original LLM-assisted planning docs
+plans/                      initial planning docs and findings
+best.md                     detailed write-up of the winning solution
 ```
 
 Datasets, checkpoints, `*.zip` submissions, `runs/`, `inference_eval/`,
@@ -100,7 +101,7 @@ Phase 2 fixes following the Simple-BEV paper recipe (arXiv 2206.07959):
 
 Test IoU ~**0.52**. Threshold tuning on val started to hurt test —
 diagnosed as residual val/test mismatch in rover frequencies
-(see [plans/06_gpt_findings_round2.md](plans/06_gpt_findings_round2.md)).
+(see [plans/06_findings_round2.md](plans/06_findings_round2.md)).
 Memory blew up during threshold sweep on full val; the streaming sweep
 in [src/metrics.py](src/metrics.py) fixed it (constant memory regardless of
 dataset size).
